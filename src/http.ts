@@ -4,13 +4,13 @@
  * Endpoint: POST https://<host>/mcp
  * Optional: Authorization: Bearer <MCP_API_KEY>
  */
-import "dotenv/config";
-import type { Request, Response, NextFunction } from "express";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import "dotenv/config";
+import type { NextFunction, Request, Response } from "express";
 import { createHcpServer } from "./create-server.js";
+import { getDatabase } from "./lib/database.js";
 import { optionalEnv } from "./lib/env.js";
-import { getSupabaseClient } from "./lib/supabase.js";
 
 const apiKey = optionalEnv("MCP_API_KEY");
 const host = optionalEnv("HOST") ?? "0.0.0.0";
@@ -41,7 +41,7 @@ app.get("/health", (_req, res) => {
 });
 
 app.post("/mcp", authMiddleware, async (req, res) => {
-  const server = createHcpServer(getSupabaseClient());
+  const server = createHcpServer(getDatabase());
   try {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,

@@ -1,5 +1,5 @@
--- HCP Engagement mock dataset — same Supabase project as Frescopa, separate namespace (hcp_*).
--- Not connected to the Frescopa retail tables. Run in Supabase SQL Editor or via CLI.
+-- HCP Engagement mock dataset. Use a dedicated Neon project or a Supabase project.
+-- Not connected to the Frescopa retail tables.
 
 create extension if not exists "pgcrypto";
 
@@ -99,30 +99,26 @@ create index if not exists idx_hcp_prescribing_hcp on public.hcp_prescribing_tre
 create index if not exists idx_hcp_prescribing_product on public.hcp_prescribing_trends (product_id);
 create index if not exists idx_hcp_consents_hcp on public.hcp_consents (hcp_id);
 
--- --- RLS (read-only, mirrors Frescopa's anon/authenticated select policies) --
-
-alter table public.hcp_reps enable row level security;
-alter table public.hcps enable row level security;
-alter table public.hcp_products enable row level security;
-alter table public.hcp_interactions enable row level security;
-alter table public.hcp_interaction_products enable row level security;
-alter table public.hcp_prescribing_trends enable row level security;
-alter table public.hcp_consents enable row level security;
+-- Supabase API roles get read-only RLS; Neon uses the private server connection.
 
 do $$
 declare
   t text;
 begin
-  foreach t in array array[
-    'hcp_reps', 'hcps', 'hcp_products', 'hcp_interactions',
-    'hcp_interaction_products', 'hcp_prescribing_trends', 'hcp_consents'
-  ]
-  loop
-    execute format('drop policy if exists "hcp_anon_select" on public.%I', t);
-    execute format('create policy "hcp_anon_select" on public.%I for select to anon using (true)', t);
-    execute format('drop policy if exists "hcp_auth_select" on public.%I', t);
-    execute format('create policy "hcp_auth_select" on public.%I for select to authenticated using (true)', t);
-  end loop;
+  if exists (select 1 from pg_roles where rolname = 'anon')
+     and exists (select 1 from pg_roles where rolname = 'authenticated') then
+    foreach t in array array[
+      'hcp_reps', 'hcps', 'hcp_products', 'hcp_interactions',
+      'hcp_interaction_products', 'hcp_prescribing_trends', 'hcp_consents'
+    ]
+    loop
+      execute format('alter table public.%I enable row level security', t);
+      execute format('drop policy if exists "hcp_anon_select" on public.%I', t);
+      execute format('create policy "hcp_anon_select" on public.%I for select to anon using (true)', t);
+      execute format('drop policy if exists "hcp_auth_select" on public.%I', t);
+      execute format('create policy "hcp_auth_select" on public.%I for select to authenticated using (true)', t);
+    end loop;
+  end if;
 end $$;
 
 -- --- Seed: reps ---------------------------------------------------------------
@@ -372,8 +368,6 @@ left join public.hcp_interactions i on i.hcp_id = h.id
 left join samples s on s.interaction_id = i.id
 group by h.id, h.npi, h.first_name, h.last_name, h.specialty, h.tier, h.region;
 
-grant select on public.v_hcp_engagement_summary to anon, authenticated;
-
 create or replace view public.v_rep_territory_summary as
 select
   r.id as rep_id,
@@ -389,4 +383,11 @@ from public.hcp_reps r
 left join public.hcp_interactions i on i.rep_id = r.id
 group by r.id, r.name, r.territory, r.region;
 
-grant select on public.v_rep_territory_summary to anon, authenticated;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'anon')
+     and exists (select 1 from pg_roles where rolname = 'authenticated') then
+    grant select on public.v_hcp_engagement_summary to anon, authenticated;
+    grant select on public.v_rep_territory_summary to anon, authenticated;
+  end if;
+end $$;

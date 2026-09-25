@@ -1,6 +1,6 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import type { DatabaseClient } from "./lib/database.js";
 import { jsonText } from "./lib/json.js";
 
 const REGION = z.enum(["northeast", "midwest", "south", "west"]);
@@ -26,7 +26,7 @@ function sentimentScore(sentiment: string): number {
 }
 
 /** Shared MCP tool registrations for stdio and HTTP transports. */
-export function createHcpServer(supabase: SupabaseClient): McpServer {
+export function createHcpServer(sql: DatabaseClient): McpServer {
   const server = new McpServer({
     name: "hcp-engagement",
     version: "1.0.0",
@@ -43,20 +43,18 @@ export function createHcpServer(supabase: SupabaseClient): McpServer {
       limit: z.number().int().min(1).max(100).optional().default(50),
     },
     async ({ specialty, tier, region, state, limit }) => {
-      let q = supabase
-        .from("hcps")
-        .select("id, npi, first_name, last_name, credentials, specialty, tier, institution, city, state, region")
-        .eq("is_active", true)
-        .order("tier")
-        .order("last_name")
-        .limit(limit ?? 50);
-      if (specialty?.trim()) q = q.ilike("specialty", specialty.trim());
-      if (tier) q = q.eq("tier", tier);
-      if (region) q = q.eq("region", region);
-      if (state?.trim()) q = q.ilike("state", state.trim());
-      const { data, error } = await q;
-      if (error) throw new Error(error.message);
-      return jsonText({ hcp_count: data?.length ?? 0, hcps: data ?? [] });
+      const data = await sql`
+        SELECT id, npi, first_name, last_name, credentials, specialty, tier, institution, city, state, region
+        FROM public.hcps
+        WHERE is_active = true
+          AND (${specialty?.trim() || null}::text IS NULL OR specialty ILIKE ${specialty?.trim() || null})
+          AND (${tier ?? null}::text IS NULL OR tier = ${tier ?? null})
+          AND (${region ?? null}::text IS NULL OR region = ${region ?? null})
+          AND (${state?.trim() || null}::text IS NULL OR state ILIKE ${state?.trim() || null})
+        ORDER BY tier, last_name
+        LIMIT ${limit ?? 50}
+      `;
+      return jsonText({ hcp_count: data.length, hcps: data });
     }
   );
 
@@ -68,28 +66,12 @@ export function createHcpServer(supabase: SupabaseClient): McpServer {
     },
     async ({ query: qstr }) => {
       const term = `%${qstr.trim()}%`;
-      const base = () =>
-        supabase
-          .from("hcps")
-          .select("id, npi, first_name, last_name, credentials, specialty, tier, institution, city, state, region")
-          .eq("is_active", true);
-      const [{ data: byNpi, error: e1 }, { data: byLast, error: e2 }, { data: byFirst, error: e3 }, { data: byInst, error: e4 }] =
-        await Promise.all([
-          base().ilike("npi", term),
-          base().ilike("last_name", term),
-          base().ilike("first_name", term),
-          base().ilike("institution", term),
-        ]);
-      if (e1) throw new Error(e1.message);
-      if (e2) throw new Error(e2.message);
-      if (e3) throw new Error(e3.message);
-      if (e4) throw new Error(e4.message);
-      type H = NonNullable<typeof byNpi>[number];
-      const map = new Map<string, H>();
-      for (const row of [...(byNpi ?? []), ...(byLast ?? []), ...(byFirst ?? []), ...(byInst ?? [])]) {
-        map.set(row.id, row);
-      }
-      const hcps = [...map.values()];
+      const hcps = await sql`
+        SELECT id, npi, first_name, last_name, credentials, specialty, tier, institution, city, state, region
+        FROM public.hcps
+        WHERE is_active = true
+          AND (npi ILIKE ${term} OR last_name ILIKE ${term} OR first_name ILIKE ${term} OR institution ILIKE ${term})
+      `;
       if (!hcps.length) return jsonText({ matches: [], note: "No HCPs match the query." });
       return jsonText({ matches: hcps.length, hcps });
     }
@@ -102,18 +84,14 @@ export function createHcpServer(supabase: SupabaseClient): McpServer {
       npi: z.string().min(1).describe("10-digit NPI, e.g. 1000000001"),
     },
     async ({ npi }) => {
-      const { data: hcp, error: he } = await supabase.from("hcps").select("*").eq("npi", npi.trim()).maybeSingle();
-      if (he) throw new Error(he.message);
+      const [hcp] = await sql`SELECT * FROM public.hcps WHERE npi = ${npi.trim()} LIMIT 1`;
       if (!hcp) return jsonText({ note: `No HCP found with NPI ${npi}.` });
 
-      const [{ data: consents, error: ce }, { data: summary, error: se }] = await Promise.all([
-        supabase.from("hcp_consents").select("consent_type, status, updated_at").eq("hcp_id", hcp.id),
-        supabase.from("v_hcp_engagement_summary").select("*").eq("hcp_id", hcp.id).maybeSingle(),
+      const [consents, summaries] = await Promise.all([
+        sql`SELECT consent_type, status, updated_at FROM public.hcp_consents WHERE hcp_id = ${hcp.id}::uuid`,
+        sql`SELECT * FROM public.v_hcp_engagement_summary WHERE hcp_id = ${hcp.id}::uuid LIMIT 1`,
       ]);
-      if (ce) throw new Error(ce.message);
-      if (se) throw new Error(se.message);
-
-      return jsonText({ hcp, consents: consents ?? [], engagement_summary: summary ?? null });
+      return jsonText({ hcp, consents, engagement_summary: summaries[0] ?? null });
     }
   );
 
@@ -130,45 +108,46 @@ export function createHcpServer(supabase: SupabaseClient): McpServer {
       limit: z.number().int().min(1).max(200).optional().default(50),
     },
     async ({ npi, region, specialty, rep_name, interaction_type, since_days, limit }) => {
-      let hcpIds: string[] | undefined;
-      if (npi?.trim() || region || specialty?.trim()) {
-        let hq = supabase.from("hcps").select("id");
-        if (npi?.trim()) hq = hq.eq("npi", npi.trim());
-        if (region) hq = hq.eq("region", region);
-        if (specialty?.trim()) hq = hq.ilike("specialty", specialty.trim());
-        const { data: hcps, error: he } = await hq;
-        if (he) throw new Error(he.message);
-        if (!hcps?.length) return jsonText({ interactions: [], note: "No HCPs match the given npi/region/specialty filter." });
-        hcpIds = hcps.map((h) => h.id);
+      const npiValue = npi?.trim() || null;
+      const specialtyValue = specialty?.trim() || null;
+      const repNameValue = rep_name?.trim() ? `%${rep_name.trim()}%` : null;
+      if (npiValue || region || specialtyValue) {
+        const hcps = await sql`
+          SELECT id FROM public.hcps
+          WHERE (${npiValue}::text IS NULL OR npi = ${npiValue})
+            AND (${region ?? null}::text IS NULL OR region = ${region ?? null})
+            AND (${specialtyValue}::text IS NULL OR specialty ILIKE ${specialtyValue})
+          LIMIT 1
+        `;
+        if (!hcps.length) return jsonText({ interactions: [], note: "No HCPs match the given npi/region/specialty filter." });
       }
-
-      let repId: string | undefined;
-      if (rep_name?.trim()) {
-        const { data: reps, error: re } = await supabase
-          .from("hcp_reps")
-          .select("id")
-          .ilike("name", `%${rep_name.trim()}%`);
-        if (re) throw new Error(re.message);
-        if (!reps?.length) return jsonText({ interactions: [], note: `No rep matches "${rep_name}".` });
-        repId = reps[0].id;
+      if (repNameValue) {
+        const reps = await sql`SELECT id FROM public.hcp_reps WHERE name ILIKE ${repNameValue} LIMIT 1`;
+        if (!reps.length) return jsonText({ interactions: [], note: `No rep matches "${rep_name}".` });
       }
 
       const sinceDate = new Date(Date.now() - (since_days ?? 90) * 86400000).toISOString();
-      let q = supabase
-        .from("hcp_interactions")
-        .select(
-          "id, occurred_at, interaction_type, duration_minutes, sentiment, samples_left, notes, hcp:hcps(npi,first_name,last_name,specialty,region), rep:hcp_reps(name,territory), products:hcp_interaction_products(samples_qty,materials_shared,key_message,product:hcp_products(brand_name))"
-        )
-        .gte("occurred_at", sinceDate)
-        .order("occurred_at", { ascending: false })
-        .limit(limit ?? 50);
-      if (hcpIds) q = q.in("hcp_id", hcpIds);
-      if (repId) q = q.eq("rep_id", repId);
-      if (interaction_type) q = q.eq("interaction_type", interaction_type);
-
-      const { data, error } = await q;
-      if (error) throw new Error(error.message);
-      return jsonText({ interaction_count: data?.length ?? 0, interactions: data ?? [] });
+      const data = await sql`
+        SELECT i.id, i.occurred_at, i.interaction_type, i.duration_minutes, i.sentiment, i.samples_left, i.notes,
+          json_build_object('npi', h.npi, 'first_name', h.first_name, 'last_name', h.last_name, 'specialty', h.specialty, 'region', h.region) AS hcp,
+          json_build_object('name', r.name, 'territory', r.territory) AS rep,
+          COALESCE((SELECT json_agg(json_build_object('samples_qty', ip.samples_qty, 'materials_shared', ip.materials_shared,
+            'key_message', ip.key_message, 'product', json_build_object('brand_name', p.brand_name)))
+            FROM public.hcp_interaction_products ip JOIN public.hcp_products p ON p.id = ip.product_id
+            WHERE ip.interaction_id = i.id), '[]'::json) AS products
+        FROM public.hcp_interactions i
+        JOIN public.hcps h ON h.id = i.hcp_id
+        JOIN public.hcp_reps r ON r.id = i.rep_id
+        WHERE i.occurred_at >= ${sinceDate}::timestamptz
+          AND (${npiValue}::text IS NULL OR h.npi = ${npiValue})
+          AND (${region ?? null}::text IS NULL OR h.region = ${region ?? null})
+          AND (${specialtyValue}::text IS NULL OR h.specialty ILIKE ${specialtyValue})
+          AND (${repNameValue}::text IS NULL OR r.id = (SELECT id FROM public.hcp_reps WHERE name ILIKE ${repNameValue} LIMIT 1))
+          AND (${interaction_type ?? null}::text IS NULL OR i.interaction_type = ${interaction_type ?? null})
+        ORDER BY i.occurred_at DESC
+        LIMIT ${limit ?? 50}
+      `;
+      return jsonText({ interaction_count: data.length, interactions: data });
     }
   );
 
@@ -182,17 +161,15 @@ export function createHcpServer(supabase: SupabaseClient): McpServer {
       limit: z.number().int().min(1).max(100).optional().default(30),
     },
     async ({ tier, specialty, region, limit }) => {
-      let q = supabase
-        .from("v_hcp_engagement_summary")
-        .select("*")
-        .order("total_interactions", { ascending: false })
-        .limit(limit ?? 30);
-      if (tier) q = q.eq("tier", tier);
-      if (specialty?.trim()) q = q.ilike("specialty", specialty.trim());
-      if (region) q = q.eq("region", region);
-      const { data, error } = await q;
-      if (error) throw new Error(error.message);
-      return jsonText({ hcp_count: data?.length ?? 0, engagement: data ?? [] });
+      const data = await sql`
+        SELECT * FROM public.v_hcp_engagement_summary
+        WHERE (${tier ?? null}::text IS NULL OR tier = ${tier ?? null})
+          AND (${specialty?.trim() || null}::text IS NULL OR specialty ILIKE ${specialty?.trim() || null})
+          AND (${region ?? null}::text IS NULL OR region = ${region ?? null})
+        ORDER BY total_interactions DESC
+        LIMIT ${limit ?? 30}
+      `;
+      return jsonText({ hcp_count: data.length, engagement: data });
     }
   );
 
@@ -205,29 +182,21 @@ export function createHcpServer(supabase: SupabaseClient): McpServer {
       months_back: z.number().int().min(1).max(24).optional().default(6),
     },
     async ({ npi, brand_name, months_back }) => {
-      const { data: hcp, error: he } = await supabase.from("hcps").select("id").eq("npi", npi.trim()).maybeSingle();
-      if (he) throw new Error(he.message);
+      const [hcp] = await sql`SELECT id FROM public.hcps WHERE npi = ${npi.trim()} LIMIT 1`;
       if (!hcp) return jsonText({ trends: [], note: `No HCP found with NPI ${npi}.` });
 
       const sinceMonth = new Date();
       sinceMonth.setMonth(sinceMonth.getMonth() - (months_back ?? 6));
-      let q = supabase
-        .from("hcp_prescribing_trends")
-        .select("month, new_rx_count, total_rx_count, market_share_pct, product:hcp_products(brand_name,generic_name,therapeutic_area)")
-        .eq("hcp_id", hcp.id)
-        .gte("month", sinceMonth.toISOString().slice(0, 10))
-        .order("month", { ascending: true });
-      const { data, error } = await q;
-      if (error) throw new Error(error.message);
-
-      const filtered = brand_name?.trim()
-        ? (data ?? []).filter((row) => {
-            const product = row.product as { brand_name?: string } | null;
-            return product?.brand_name?.toLowerCase() === brand_name.trim().toLowerCase();
-          })
-        : (data ?? []);
-
-      return jsonText({ npi, trend_rows: filtered.length, trends: filtered });
+      const data = await sql`
+        SELECT t.month, t.new_rx_count, t.total_rx_count, t.market_share_pct,
+          json_build_object('brand_name', p.brand_name, 'generic_name', p.generic_name, 'therapeutic_area', p.therapeutic_area) AS product
+        FROM public.hcp_prescribing_trends t JOIN public.hcp_products p ON p.id = t.product_id
+        WHERE t.hcp_id = ${hcp.id}::uuid
+          AND t.month >= ${sinceMonth.toISOString().slice(0, 10)}::date
+          AND (${brand_name?.trim() || null}::text IS NULL OR lower(p.brand_name) = lower(${brand_name?.trim() || null}))
+        ORDER BY t.month ASC
+      `;
+      return jsonText({ npi, trend_rows: data.length, trends: data });
     }
   );
 
@@ -241,36 +210,31 @@ export function createHcpServer(supabase: SupabaseClient): McpServer {
       quarters_back: z.number().int().min(1).max(8).optional().default(2),
     },
     async ({ brand_name, region, specialty, quarters_back }) => {
-      const { data: product, error: pe } = await supabase
-        .from("hcp_products")
-        .select("id, brand_name")
-        .ilike("brand_name", `%${brand_name.trim()}%`)
-        .maybeSingle();
-      if (pe) throw new Error(pe.message);
+      const [product] = await sql`
+        SELECT id, brand_name FROM public.hcp_products WHERE brand_name ILIKE ${`%${brand_name.trim()}%`}
+        LIMIT 1
+      `;
       if (!product) return jsonText({ note: `No product matches "${brand_name}".` });
 
-      let hq = supabase.from("hcps").select("id, npi, first_name, last_name, region, specialty, tier");
-      if (region) hq = hq.eq("region", region);
-      if (specialty?.trim()) hq = hq.ilike("specialty", specialty.trim());
-      const { data: hcps, error: he } = await hq;
-      if (he) throw new Error(he.message);
-      if (!hcps?.length) return jsonText({ note: "No HCPs match the given region/specialty filter." });
+      const hcps = await sql`
+        SELECT id, npi, first_name, last_name, region, specialty, tier FROM public.hcps
+        WHERE (${region ?? null}::text IS NULL OR region = ${region ?? null})
+          AND (${specialty?.trim() || null}::text IS NULL OR specialty ILIKE ${specialty?.trim() || null})
+      `;
+      if (!hcps.length) return jsonText({ note: "No HCPs match the given region/specialty filter." });
       const hcpMap = new Map(hcps.map((h) => [h.id, h]));
 
       const cutoff = new Date();
       cutoff.setMonth(cutoff.getMonth() - (quarters_back ?? 2) * 3);
-      const { data: rows, error: te } = await supabase
-        .from("hcp_prescribing_trends")
-        .select("hcp_id, month, new_rx_count, total_rx_count, market_share_pct")
-        .eq("product_id", product.id)
-        .in(
-          "hcp_id",
-          hcps.map((h) => h.id)
-        )
-        .gte("month", cutoff.toISOString().slice(0, 10))
-        .order("month", { ascending: true });
-      if (te) throw new Error(te.message);
-      if (!rows?.length) return jsonText({ product: product.brand_name, segment_rollup: [], hcp_quarterly: [] });
+      const rows = await sql`
+        SELECT hcp_id, month::text, new_rx_count, total_rx_count, market_share_pct
+        FROM public.hcp_prescribing_trends
+        WHERE product_id = ${product.id}::uuid
+          AND hcp_id = ANY(${hcps.map((hcp) => hcp.id)}::uuid[])
+          AND month >= ${cutoff.toISOString().slice(0, 10)}::date
+        ORDER BY month ASC
+      `;
+      if (!rows.length) return jsonText({ product: product.brand_name, segment_rollup: [], hcp_quarterly: [] });
 
       type HcpQuarter = {
         npi: string;
@@ -370,28 +334,23 @@ export function createHcpServer(supabase: SupabaseClient): McpServer {
       quarters_back: z.number().int().min(1).max(8).optional().default(2),
     },
     async ({ region, specialty, interaction_type, quarters_back }) => {
-      let hq = supabase.from("hcps").select("id, region, specialty");
-      if (region) hq = hq.eq("region", region);
-      if (specialty?.trim()) hq = hq.ilike("specialty", specialty.trim());
-      const { data: hcps, error: he } = await hq;
-      if (he) throw new Error(he.message);
-      if (!hcps?.length) return jsonText({ note: "No HCPs match the given region/specialty filter." });
+      const hcps = await sql`
+        SELECT id, region, specialty FROM public.hcps
+        WHERE (${region ?? null}::text IS NULL OR region = ${region ?? null})
+          AND (${specialty?.trim() || null}::text IS NULL OR specialty ILIKE ${specialty?.trim() || null})
+      `;
+      if (!hcps.length) return jsonText({ note: "No HCPs match the given region/specialty filter." });
       const hcpMap = new Map(hcps.map((h) => [h.id, h]));
 
       const cutoff = new Date();
       cutoff.setMonth(cutoff.getMonth() - (quarters_back ?? 2) * 3);
-      let q = supabase
-        .from("hcp_interactions")
-        .select("hcp_id, occurred_at, sentiment")
-        .in(
-          "hcp_id",
-          hcps.map((h) => h.id)
-        )
-        .gte("occurred_at", cutoff.toISOString());
-      if (interaction_type) q = q.eq("interaction_type", interaction_type);
-      const { data: rows, error: ie } = await q;
-      if (ie) throw new Error(ie.message);
-      if (!rows?.length) return jsonText({ segment_rollup: [] });
+      const rows = await sql`
+        SELECT hcp_id, occurred_at, sentiment FROM public.hcp_interactions
+        WHERE hcp_id = ANY(${hcps.map((hcp) => hcp.id)}::uuid[])
+          AND occurred_at >= ${cutoff.toISOString()}::timestamptz
+          AND (${interaction_type ?? null}::text IS NULL OR interaction_type = ${interaction_type ?? null})
+      `;
+      if (!rows.length) return jsonText({ segment_rollup: [] });
 
       type Segment = { region: string; specialty: string; quarter: string; interaction_count: number; sentiment_sum: number; hcps: Set<string> };
       const bySegment = new Map<string, Segment>();
@@ -435,12 +394,13 @@ export function createHcpServer(supabase: SupabaseClient): McpServer {
       rep_name: z.string().optional().describe("Partial match on rep name"),
     },
     async ({ region, rep_name }) => {
-      let q = supabase.from("v_rep_territory_summary").select("*").order("total_interactions", { ascending: false });
-      if (region) q = q.eq("region", region);
-      if (rep_name?.trim()) q = q.ilike("rep_name", `%${rep_name.trim()}%`);
-      const { data, error } = await q;
-      if (error) throw new Error(error.message);
-      return jsonText({ rep_count: data?.length ?? 0, reps: data ?? [] });
+      const data = await sql`
+        SELECT * FROM public.v_rep_territory_summary
+        WHERE (${region ?? null}::text IS NULL OR region = ${region ?? null})
+          AND (${rep_name?.trim() ? `%${rep_name.trim()}%` : null}::text IS NULL OR rep_name ILIKE ${rep_name?.trim() ? `%${rep_name.trim()}%` : null})
+        ORDER BY total_interactions DESC
+      `;
+      return jsonText({ rep_count: data.length, reps: data });
     }
   );
 

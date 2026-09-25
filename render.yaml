@@ -3,15 +3,13 @@ services:
   - type: web
     name: hcp-mcp
     runtime: node
-    buildCommand: npm install --omit=dev
+    buildCommand: npm install && npm run build
     startCommand: node dist/http.js
     healthCheckPath: /health
     envVars:
       - key: NODE_VERSION
         value: "20"
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_ANON_KEY
+      - key: DATABASE_URL
         sync: false
       - key: MCP_API_KEY
         sync: false

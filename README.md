@@ -1,10 +1,10 @@
-# HCP Engagement × Supabase × MCP (mock pharma demo)
+# HCP Engagement x Neon x MCP (mock pharma demo)
 
-**Model Context Protocol** server for simulated Healthcare Professional (HCP) engagement data — reps, visits/calls/emails, consent status, and prescribing trends — from **Supabase**.
+**Model Context Protocol** server for simulated Healthcare Professional (HCP) engagement data — reps, visits/calls/emails, consent status, and prescribing trends — from **Neon**.
 
 All data is synthetic (`example-pharma.com` reps, fictional drug names like `Cardiozin`, sequential NPIs). This is **not** real provider or prescribing data.
 
-Shares the same Supabase project as the separate [Frescopa MCP](https://github.com/zkorczyc/Frescopa-stock) repo, but lives in its own table namespace (`hcps`, `hcp_reps`, `hcp_products`, `hcp_interactions`, `hcp_interaction_products`, `hcp_prescribing_trends`, `hcp_consents`) — no foreign keys, joins, or code shared between the two.
+Uses the separate Neon project **we.Healthcare** (`young-river-28343758`), not the [Frescopa MCP](https://github.com/zkorczyc/Frescopa-stock) database. Its tables are `hcps`, `hcp_reps`, `hcp_products`, `hcp_interactions`, `hcp_interaction_products`, `hcp_prescribing_trends`, and `hcp_consents`.
 
 | Mode | Use case |
 |------|----------|
@@ -15,21 +15,29 @@ Shares the same Supabase project as the separate [Frescopa MCP](https://github.c
 
 | Path | Purpose |
 |------|---------|
-| `../supabase/migrations/20260831000000_hcp_engagement_init.sql` | Tables, RLS (`anon`/`authenticated` read-only), seed data, views |
+| `supabase/migrations/20260831000000_hcp_engagement_init.sql` | Tables, synthetic seed data, views (Supabase RLS only when its roles exist) |
+| `supabase/migrations/20260831010000_hcp_south_visit_frequency_flat.sql` | Idempotent South/Oncology demo adjustment |
 | `src/index.ts` | MCP stdio entry |
 | `src/http.ts` | MCP HTTP entry (`POST /mcp`) |
 | `src/create-server.ts` | Shared tools |
 | `.env.example` | Env template |
 
-## Supabase setup
+## Neon setup
 
-1. **SQL**: Dashboard → **SQL Editor** → paste `../supabase/migrations/20260831000000_hcp_engagement_init.sql` → **Run**. Safe to re-run (uses `on conflict do nothing` / `create or replace view`).
-2. **API**: reuse the same `SUPABASE_URL` and `SUPABASE_ANON_KEY` from the Frescopa `.env` — same project, read-only anon key.
+The synthetic dataset is already loaded in the Healthcare project's `production` branch. Do not run these seed migrations again on a populated database without reviewing their effects. For a new empty branch, use a **direct** (unpooled) connection:
+
+```bash
+neon link --project-id young-river-28343758 --branch production -y
+neon psql production --project-id young-river-28343758 --database-name neondb -- -v ON_ERROR_STOP=1 < supabase/migrations/20260831000000_hcp_engagement_init.sql
+neon psql production --project-id young-river-28343758 --database-name neondb -- -v ON_ERROR_STOP=1 < supabase/migrations/20260831010000_hcp_south_visit_frequency_flat.sql
+```
+
+Set `DATABASE_URL` to this project's **pooled** connection string for the MCP runtime. Keep connection strings in ignored local env files and Render environment variables, never in Git.
 
 ## Local build
 
 ```bash
-cd /Users/zkorczyc/Projects/Frescopa/hcp-mcp
+cd /Users/zkorczyc/Projects/hcp-mcp
 cp .env.example .env   # skip if .env already exists
 npm install
 npm run build
@@ -42,10 +50,9 @@ npm run build
   "mcpServers": {
     "hcp-engagement": {
       "command": "node",
-      "args": ["/Users/zkorczyc/Projects/Frescopa/hcp-mcp/dist/index.js"],
+      "args": ["/Users/zkorczyc/Projects/hcp-mcp/dist/index.js"],
       "env": {
-        "SUPABASE_URL": "https://uxlccvzhuwzwzrmqunml.supabase.co",
-        "SUPABASE_ANON_KEY": "eyJ..."
+        "DATABASE_URL": "<Healthcare Neon pooled connection string>"
       }
     }
   }
@@ -87,11 +94,11 @@ The seed data has one segment deliberately built to produce this exact pattern: 
 
 ## Remote MCP URL (HTTP)
 
-Same pattern as Frescopa — see [`../README.md`](../README.md#remote-mcp-url-http) for the full walkthrough (build → `start:http` → deploy → register URL). This server defaults to **port 3100** (vs. Frescopa's 3000) so both can run locally at once.
+Deploy this repo as a Render Node service using `render.yaml`. In Render, set `DATABASE_URL` to the Healthcare project's pooled URL and `MCP_API_KEY` to a separate secret if the MCP client can send `Authorization: Bearer <MCP_API_KEY>`. The HTTP endpoint is `POST /mcp`; `GET /health` checks server availability but does not query the database. This server defaults to **port 3100** locally (vs. Frescopa's 3000).
 
 ## Security
 
-- Do not commit `.env` or **service role** keys.
-- Demo is safe with **anon** + RLS limited to `SELECT`.
+- Do not commit `.env`, `.env.local`, or database credentials.
+- The Neon database role used by `DATABASE_URL` can write data; use a read-only role for a public read-only MCP deployment.
 - Data is synthetic — do not populate with real patient, prescriber, or PHI/PII data.
 - **HTTP:** always set `MCP_API_KEY` on public deploy.
